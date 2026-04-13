@@ -919,6 +919,16 @@ pub fn pretty_filetype(mode: mode_t, size: u64) -> String {
     .to_owned()
 }
 
+/// Returns the unique 128-bit file ID for the given path.
+#[cfg(windows)]
+pub fn file_id_for_path(path: &Path) -> UResult<u128> {
+    use super::nt::*;
+    let handle = open_file(path, SYNCHRONIZE, FILE_SYNCHRONOUS_IO_NONALERT)?;
+    let info =
+        unsafe { query_information_file::<FILE_ID_INFORMATION>(&handle, FileIdInformation)? };
+    Ok(u128::from_le_bytes(info.file_id))
+}
+
 pub fn pretty_fstype<'a>(fstype: i64) -> Cow<'a, str> {
     // spell-checker:disable
     match fstype {

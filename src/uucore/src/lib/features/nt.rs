@@ -32,6 +32,8 @@ pub const FileFsDeviceInformation: u32 = 4;
 pub const FileFsAttributeInformation: u32 = 5;
 #[allow(non_upper_case_globals)]
 pub const FileFsFullSizeInformation: u32 = 7;
+#[allow(non_upper_case_globals)]
+pub const FileIdInformation: u32 = 59;
 
 #[repr(C)]
 pub struct FILE_FS_DEVICE_INFORMATION {
@@ -54,6 +56,12 @@ pub struct FILE_FS_FULL_SIZE_INFORMATION {
     pub actual_available_allocation_units: i64,
     pub sectors_per_allocation_unit: u32,
     pub bytes_per_sector: u32,
+}
+
+#[repr(C)]
+pub struct FILE_ID_INFORMATION {
+    pub volume_serial_number: u64,
+    pub file_id: [u8; 16],
 }
 
 #[repr(C)]
@@ -90,6 +98,14 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     fn NtClose(handle: *mut std::ffi::c_void) -> NTSTATUS;
+
+    fn NtQueryInformationFile(
+        file_handle: *mut std::ffi::c_void,
+        io_status_block: *mut IO_STATUS_BLOCK,
+        file_information: *mut std::ffi::c_void,
+        length: u32,
+        file_information_class: u32,
+    ) -> NTSTATUS;
 
     fn NtQueryVolumeInformationFile(
         file_handle: *mut std::ffi::c_void,
@@ -218,6 +234,32 @@ pub unsafe fn query_volume_information<T>(handle: &NtHandle, information_class: 
                 "NtQueryVolumeInformationFile failed: 0x{:08X}",
                 status as u32
             ),
+        ));
+    }
+    Ok(unsafe { info.assume_init() })
+}
+
+/// Queries file information for the given handle.
+///
+/// # Safety
+///
+/// `T` must be the correct struct for the given `information_class`.
+pub unsafe fn query_information_file<T>(handle: &NtHandle, information_class: u32) -> UResult<T> {
+    let mut info = MaybeUninit::<T>::uninit();
+    let mut iosb = MaybeUninit::<IO_STATUS_BLOCK>::uninit();
+    let status = unsafe {
+        NtQueryInformationFile(
+            handle.0,
+            iosb.as_mut_ptr(),
+            info.as_mut_ptr().cast(),
+            size_of::<T>() as u32,
+            information_class,
+        )
+    };
+    if status < 0 {
+        return Err(USimpleError::new(
+            1,
+            format!("NtQueryInformationFile failed: 0x{:08X}", status as u32),
         ));
     }
     Ok(unsafe { info.assume_init() })
