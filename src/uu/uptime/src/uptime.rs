@@ -54,20 +54,17 @@ impl UError for UptimeError {
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
 
-    #[cfg(unix)]
-    let file_path = matches.get_one::<OsString>(options::PATH);
-    #[cfg(windows)]
-    let file_path = None;
-
     if matches.get_flag(options::SINCE) {
-        uptime_since()
-    } else if matches.get_flag(options::PRETTY) {
-        pretty_print_uptime()
-    } else if let Some(path) = file_path {
-        uptime_with_file(path)
-    } else {
-        default_uptime()
+        return uptime_since();
     }
+    if matches.get_flag(options::PRETTY) {
+        return pretty_print_uptime();
+    }
+    #[cfg(unix)]
+    if let Some(path) = matches.get_one::<OsString>(options::PATH) {
+        return uptime_with_file(path);
+    }
+    default_uptime()
 }
 
 pub fn uu_app() -> Command {
@@ -88,6 +85,13 @@ pub fn uu_app() -> Command {
                 .long(options::SINCE)
                 .help(translate!("uptime-help-since"))
                 .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new(options::PRETTY)
+                .short('p')
+                .long(options::PRETTY)
+                .help(translate!("uptime-help-pretty"))
+                .action(ArgAction::SetTrue),
         );
     #[cfg(unix)]
     cmd.arg(
@@ -97,14 +101,8 @@ pub fn uu_app() -> Command {
             .num_args(0..=1)
             .value_parser(ValueParser::os_string())
             .value_hint(ValueHint::AnyPath),
-    )
-    .arg(
-        Arg::new(options::PRETTY)
-            .short('p')
-            .long(options::PRETTY)
-            .help(translate!("uptime-help-pretty"))
-            .action(ArgAction::SetTrue),
-    )
+    );
+    cmd
 }
 
 #[cfg(unix)]
@@ -230,7 +228,9 @@ fn default_uptime() -> UResult<()> {
 #[inline]
 fn print_loadavg() -> UResult<()> {
     if let Ok(s) = get_formatted_loadavg() {
-        writeln!(stdout(), "{s}")?;
+        writeln!(stdout(), ",  {s}")?;
+    } else {
+        writeln!(stdout())?;
     }
     Ok(())
 }
@@ -264,7 +264,7 @@ fn process_utmpx(file: Option<&OsString>) -> (Option<time_t>, usize) {
 fn print_nusers(nusers: Option<usize>) -> UResult<()> {
     write!(
         stdout(),
-        "{},  ",
+        "{}",
         match nusers {
             None => {
                 get_formatted_nusers()
