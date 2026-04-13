@@ -13,6 +13,10 @@ use std::{io::Error, mem::MaybeUninit};
 use crate::error::{UResult, USimpleError};
 
 use windows_sys::Win32::Foundation::NTSTATUS;
+use windows_sys::Win32::Security::{
+    GROUP_SECURITY_INFORMATION, GetFileSecurityW, GetLengthSid, LookupAccountSidW,
+    OWNER_SECURITY_INFORMATION, PSID, SidTypeUnknown,
+};
 
 pub const SYNCHRONIZE: u32 = 0x00100000;
 pub const FILE_SHARE_READ: u32 = 0x00000001;
@@ -157,11 +161,15 @@ impl Drop for UnicodeString {
     }
 }
 
+fn to_wide_null(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
 /// Opens a file or directory via `NtOpenFile`.
 ///
 /// The file is opened with full share access (`READ | WRITE | DELETE`).
 pub fn open_file(path: &Path, desired_access: u32, open_options: u32) -> UResult<NtHandle> {
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let wide = to_wide_null(path);
     let mut nt_path = UnicodeString::empty();
     if unsafe {
         RtlDosPathNameToNtPathName_U(
@@ -263,4 +271,103 @@ pub unsafe fn query_information_file<T>(handle: &NtHandle, information_class: u3
         ));
     }
     Ok(unsafe { info.assume_init() })
+}
+
+pub const SECURITY_MAX_SID_SIZE: usize = 68;
+pub const SECURITY_MAX_SID_STRING_CHARACTERS: usize = 187;
+
+pub type Sid = [u8; SECURITY_MAX_SID_SIZE];
+
+#[repr(C)]
+struct SECURITY_DESCRIPTOR_RELATIVE {
+    revision: u8,
+    sbz1: u8,
+    control: u16,
+    owner: u32,
+    group: u32,
+    sacl: u32,
+    dacl: u32,
+}
+
+/// # Safety
+/// `sd` must point to a valid self-relative security descriptor.
+/// `offset` must be a valid SID offset within it, or 0.
+unsafe fn sd_sid_to_fixed(sd: *const SECURITY_DESCRIPTOR_RELATIVE, offset: u32) -> Sid {
+    let mut buf = [0u8; SECURITY_MAX_SID_SIZE];
+
+    if offset != 0 {
+        let psid = unsafe { (sd as *const u8).add(offset as usize) } as PSID;
+        let len = unsafe { GetLengthSid(psid) } as usize;
+        unsafe { ptr::copy_nonoverlapping(psid as *const u8, buf.as_mut_ptr(), len) };
+    }
+
+    buf
+}
+
+/// Resolves a SID to an account name via `LookupAccountSidW`.
+pub fn resolve_sid_to_name(psid: PSID) -> Option<String> {
+    let mut name_buf = [0u16; SECURITY_MAX_SID_STRING_CHARACTERS];
+    let mut domain_buf = [0u16; SECURITY_MAX_SID_STRING_CHARACTERS];
+    let mut name_len: u32 = name_buf.len() as u32;
+    let mut domain_len: u32 = domain_buf.len() as u32;
+    let mut sid_use = SidTypeUnknown;
+
+    let ok = unsafe {
+        LookupAccountSidW(
+            ptr::null(),
+            psid,
+            name_buf.as_mut_ptr(),
+            &mut name_len,
+            domain_buf.as_mut_ptr(),
+            &mut domain_len,
+            &mut sid_use,
+        )
+    };
+
+    if ok == 0 {
+        return None;
+    }
+
+    Some(String::from_utf16_lossy(&name_buf[..name_len as usize]))
+}
+
+#[derive(Debug)]
+pub struct OwnerGroup {
+    pub owner_sid: Sid,
+    pub group_sid: Sid,
+}
+
+/// Retrieves owner and group SIDs via `GetFileSecurityW` into a
+/// stack-allocated buffer. Returns `None` on failure.
+pub fn path_to_owner_and_group(path: &Path) -> Option<OwnerGroup> {
+    // The buffer must be u32-aligned for SECURITY_DESCRIPTOR_RELATIVE.
+    #[repr(C)]
+    struct SdBuf {
+        sd: SECURITY_DESCRIPTOR_RELATIVE,
+        sids: [u8; 2 * SECURITY_MAX_SID_SIZE],
+    }
+
+    let wide_path = to_wide_null(path);
+    let mut buf = MaybeUninit::<SdBuf>::uninit();
+    let mut needed: u32 = 0;
+
+    if unsafe {
+        GetFileSecurityW(
+            wide_path.as_ptr(),
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
+            buf.as_mut_ptr().cast(),
+            size_of::<SdBuf>() as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        return None;
+    }
+
+    let sd = buf.as_ptr().cast::<SECURITY_DESCRIPTOR_RELATIVE>();
+
+    Some(OwnerGroup {
+        owner_sid: unsafe { sd_sid_to_fixed(sd, (*sd).owner) },
+        group_sid: unsafe { sd_sid_to_fixed(sd, (*sd).group) },
+    })
 }

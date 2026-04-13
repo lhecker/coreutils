@@ -118,6 +118,7 @@ wild = "2.2.1"
 winapi-util = { workspace = true, optional = true }
 windows-sys = { workspace = true, optional = true, default-features = false, features = [
   "Wdk_System_SystemInformation",
+  "Win32_Security",
   "Win32_Storage_FileSystem",
   "Win32_Foundation",
   "Win32_System_RemoteDesktop",

@@ -6,8 +6,6 @@
 // spell-checker:ignore (ToDO) somegroup nlink tabsize dired subdired dtype colorterm stringly
 // spell-checker:ignore nohash strtime clocale
 
-#[cfg(unix)]
-use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -813,6 +811,8 @@ struct PathData<'a> {
     command_line: bool,
     #[cfg(windows)]
     inode: OnceCell<Option<u128>>,
+    #[cfg(windows)]
+    owner_group: OnceCell<uucore::nt::OwnerGroup>,
 }
 
 impl<'a> PathData<'a> {
@@ -890,6 +890,8 @@ impl<'a> PathData<'a> {
             command_line,
             #[cfg(windows)]
             inode: OnceCell::new(),
+            #[cfg(windows)]
+            owner_group: OnceCell::new(),
         }
     }
 
@@ -949,6 +951,16 @@ impl<'a> PathData<'a> {
             .get_or_init(|| uucore::fsext::file_id_for_path(&self.path()).ok())
     }
 
+    #[cfg(windows)]
+    fn owner_group(&self) -> &uucore::nt::OwnerGroup {
+        self.owner_group.get_or_init(|| {
+            uucore::nt::path_to_owner_and_group(&self.p_buf).unwrap_or(uucore::nt::OwnerGroup {
+                owner_sid: [0u8; uucore::nt::SECURITY_MAX_SID_SIZE],
+                group_sid: [0u8; uucore::nt::SECURITY_MAX_SID_SIZE],
+            })
+        })
+    }
+
     fn is_dangling_link(&self) -> bool {
         // deref enabled, self is real dir entry, self has metadata associated with link, but not with target
         self.must_dereference && self.file_type().is_none() && self.metadata().is_none()
@@ -999,19 +1011,7 @@ type DirData = (PathBuf, bool);
 struct ListState<'a> {
     out: BufWriter<Stdout>,
     style_manager: Option<StyleManager<'a>>,
-    // TODO: More benchmarking with different use cases is required here.
-    // From experiments, BTreeMap may be faster than HashMap, especially as the
-    // number of users/groups is very limited. It seems like nohash::IntMap
-    // performance was equivalent to BTreeMap.
-    // It's possible a simple vector linear(binary?) search implementation would be even faster.
-    #[cfg(unix)]
-    uid_cache: FxHashMap<u32, String>,
-    #[cfg(unix)]
-    gid_cache: FxHashMap<u32, String>,
-    #[cfg(not(unix))]
-    uid_cache: (),
-    #[cfg(not(unix))]
-    gid_cache: (),
+    owner_group_caches: display::OwnerGroupCache,
     recent_time_range: RangeInclusive<SystemTime>,
     stack: Vec<DirData>,
     listed_ancestors: FxHashSet<FileInformation>,
@@ -1030,14 +1030,7 @@ pub fn list(locs: Vec<&Path>, config: &Config) -> UResult<()> {
     let mut state = ListState {
         out: BufWriter::new(stdout()),
         style_manager: config.color.as_ref().map(StyleManager::new),
-        #[cfg(unix)]
-        uid_cache: FxHashMap::default(),
-        #[cfg(unix)]
-        gid_cache: FxHashMap::default(),
-        #[cfg(not(unix))]
-        uid_cache: (),
-        #[cfg(not(unix))]
-        gid_cache: (),
+        owner_group_caches: display::OwnerGroupCache::default(),
         // Time range for which to use the "recent" format. Anything from 0.5 year in the past to now
         // (files with modification time in the future use "old" format).
         // According to GNU a Gregorian year has 365.2425 * 24 * 60 * 60 == 31556952 seconds on the average.

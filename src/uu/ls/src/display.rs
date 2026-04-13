@@ -26,7 +26,6 @@ use std::{
 
 use ansi_width::ansi_width;
 use glob::MatchOptions;
-#[cfg(unix)]
 use rustc_hash::FxHashMap;
 use term_grid::{DEFAULT_SEPARATOR_SIZE, Direction, Filling, Grid, GridOptions};
 
@@ -262,8 +261,8 @@ fn display_dir_entry_size(
         let nlink_len = display_symlink_count(md).len();
         (
             nlink_len,
-            display_uname(md, config, &mut state.uid_cache).len(),
-            display_group(md, config, &mut state.gid_cache).len(),
+            display_uname(entry, md, config, &mut state.owner_group_caches).len(),
+            display_group(entry, md, config, &mut state.owner_group_caches).len(),
             size_len,
             major_len,
             minor_len,
@@ -557,17 +556,34 @@ fn display_additional_leading_info(
     Ok(())
 }
 
+/// Caches uid/gid (Unix) or SID (Windows) -> name lookups.
+#[derive(Default)]
+pub(crate) struct OwnerGroupCache {
+    // TODO: More benchmarking with different use cases is required here.
+    // From experiments, BTreeMap may be faster than HashMap, especially as the
+    // number of users/groups is very limited. It seems like nohash::IntMap
+    // performance was equivalent to BTreeMap.
+    // It's possible a simple vector linear(binary?) search implementation would be even faster.
+    #[cfg(unix)]
+    uid_cache: FxHashMap<u32, String>,
+    #[cfg(unix)]
+    gid_cache: FxHashMap<u32, String>,
+    #[cfg(windows)]
+    sid_names: FxHashMap<uucore::nt::Sid, String>,
+}
+
 // Currently getpwuid is `linux` target only. If it's broken state.out into
 // a posix-compliant attribute this can be updated...
 #[cfg(unix)]
 fn display_uname<'a>(
+    _item: &'a PathData,
     metadata: &Metadata,
     config: &Config,
-    uid_cache: &'a mut FxHashMap<u32, String>,
-) -> &'a String {
+    caches: &'a mut OwnerGroupCache,
+) -> &'a str {
     let uid = metadata.uid();
 
-    uid_cache.entry(uid).or_insert_with(|| {
+    caches.uid_cache.entry(uid).or_insert_with(|| {
         if config.long.numeric_uid_gid {
             uid.to_string()
         } else {
@@ -578,12 +594,13 @@ fn display_uname<'a>(
 
 #[cfg(unix)]
 fn display_group<'a>(
+    _item: &'a PathData,
     metadata: &Metadata,
     config: &Config,
-    gid_cache: &'a mut FxHashMap<u32, String>,
-) -> &'a String {
+    caches: &'a mut OwnerGroupCache,
+) -> &'a str {
     let gid = metadata.gid();
-    gid_cache.entry(gid).or_insert_with(|| {
+    caches.gid_cache.entry(gid).or_insert_with(|| {
         if config.long.numeric_uid_gid {
             gid.to_string()
         } else {
@@ -592,14 +609,30 @@ fn display_group<'a>(
     })
 }
 
-#[cfg(not(unix))]
-fn display_uname(_metadata: &Metadata, _config: &Config, _uid_cache: &mut ()) -> &'static str {
-    "somebody"
+#[cfg(windows)]
+fn display_uname<'a>(
+    item: &'a PathData,
+    _metadata: &Metadata,
+    _config: &Config,
+    caches: &'a mut OwnerGroupCache,
+) -> &'a str {
+    let sid = item.owner_group().owner_sid;
+    caches.sid_names.entry(sid).or_insert_with(|| {
+        uucore::nt::resolve_sid_to_name(sid.as_ptr().cast_mut().cast()).unwrap_or_default()
+    })
 }
 
-#[cfg(not(unix))]
-fn display_group(_metadata: &Metadata, _config: &Config, _gid_cache: &mut ()) -> &'static str {
-    "somegroup"
+#[cfg(windows)]
+fn display_group<'a>(
+    item: &'a PathData,
+    _metadata: &Metadata,
+    _config: &Config,
+    caches: &'a mut OwnerGroupCache,
+) -> &'a str {
+    let sid = item.owner_group().group_sid;
+    caches.sid_names.entry(sid).or_insert_with(|| {
+        uucore::nt::resolve_sid_to_name(sid.as_ptr().cast_mut().cast()).unwrap_or_default()
+    })
 }
 
 fn display_date(
@@ -912,7 +945,7 @@ fn display_item_long(
         if config.long.owner {
             state.display_buf.push(b' ');
             state.display_buf.extend_pad_right(
-                display_uname(md, config, &mut state.uid_cache),
+                display_uname(item, md, config, &mut state.owner_group_caches),
                 padding.uname,
             );
         }
@@ -920,7 +953,7 @@ fn display_item_long(
         if config.long.group {
             state.display_buf.push(b' ');
             state.display_buf.extend_pad_right(
-                display_group(md, config, &mut state.gid_cache),
+                display_group(item, md, config, &mut state.owner_group_caches),
                 padding.group,
             );
         }
@@ -937,7 +970,7 @@ fn display_item_long(
         if config.long.author {
             state.display_buf.push(b' ');
             state.display_buf.extend_pad_right(
-                display_uname(md, config, &mut state.uid_cache),
+                display_uname(item, md, config, &mut state.owner_group_caches),
                 padding.uname,
             );
         }

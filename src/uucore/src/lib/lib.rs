@@ -113,6 +113,8 @@ pub use crate::features::signals;
 ))]
 pub use crate::features::utmpx;
 // ** windows-only
+#[cfg(all(windows, feature = "fsext"))]
+pub use crate::features::nt;
 #[cfg(all(windows, feature = "wide"))]
 pub use crate::features::wide;
 
