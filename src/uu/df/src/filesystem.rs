@@ -18,8 +18,8 @@ use std::{ffi::OsString, path::Path};
 use std::os::unix::fs::MetadataExt;
 
 #[cfg(unix)]
-use uucore::fsext::{FsMeta, pretty_fstype, statfs};
-use uucore::fsext::{FsUsage, MountInfo};
+use uucore::fsext::{FsMeta, pretty_fstype};
+use uucore::fsext::{FsUsage, MountInfo, statfs};
 
 /// Summary representation of a filesystem.
 ///
@@ -166,10 +166,7 @@ impl Filesystem {
         } else {
             mount_info.mount_dir.clone()
         };
-        #[cfg(unix)]
         let usage = FsUsage::new(statfs(&stat_path).ok()?);
-        #[cfg(windows)]
-        let usage = FsUsage::new(Path::new(&stat_path)).ok()?;
         Some(Self {
             file,
             mount_info,
