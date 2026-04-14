@@ -690,10 +690,11 @@ fn compute_and_check_digest_from_file(
     // Read the file and calculate the checksum
     let mut digest = algo.create_digest();
 
-    // Set binary to false because --binary is not supported with --check
+    // Always use binary mode to match the computation path,
+    // which ignores the --text/--binary distinction per #9168.
 
     let (calculated_checksum, _) =
-        match digest_reader(&mut digest, &mut file_reader, ReadingMode::Text) {
+        match digest_reader(&mut digest, &mut file_reader, ReadingMode::Binary) {
             Ok(result) => result,
             Err(err) => {
                 show!(err.map_err_context(|| {
