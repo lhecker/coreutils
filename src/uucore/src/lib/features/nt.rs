@@ -7,9 +7,11 @@
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use std::ptr;
+use std::time::SystemTime;
+use std::{io, ptr};
 use std::{io::Error, mem::MaybeUninit};
 
+use super::fsext::MetadataTimeField;
 use crate::error::{UResult, USimpleError};
 
 use windows_sys::Win32::Foundation::NTSTATUS;
@@ -18,11 +20,16 @@ use windows_sys::Win32::Security::{
     OWNER_SECURITY_INFORMATION, PSID, SidTypeUnknown,
 };
 
+pub const READ_CONTROL: u32 = 0x00020000;
 pub const SYNCHRONIZE: u32 = 0x00100000;
+pub const FILE_READ_EA: u32 = 0x00000008;
+pub const FILE_READ_ATTRIBUTES: u32 = 0x00000080;
 pub const FILE_SHARE_READ: u32 = 0x00000001;
 pub const FILE_SHARE_WRITE: u32 = 0x00000002;
 pub const FILE_SHARE_DELETE: u32 = 0x00000004;
 pub const FILE_DIRECTORY_FILE: u32 = 0x00000001;
+pub const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x00004000;
+pub const FILE_OPEN_REPARSE_POINT: u32 = 0x00200000;
 pub const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
 pub const FILE_OPEN_FOR_FREE_SPACE_QUERY: u32 = 0x00800000;
 
@@ -30,6 +37,13 @@ const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;
 
 pub const FILE_REMOTE_DEVICE: u32 = 0x00000010;
 
+const FILE_ATTRIBUTE_READONLY: u32 = 0x00000001;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000000C;
+const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
+
+#[allow(non_upper_case_globals)]
+pub const FileBasicInformation: u32 = 4;
 #[allow(non_upper_case_globals)]
 pub const FileFsDeviceInformation: u32 = 4;
 #[allow(non_upper_case_globals)]
@@ -38,6 +52,10 @@ pub const FileFsAttributeInformation: u32 = 5;
 pub const FileFsFullSizeInformation: u32 = 7;
 #[allow(non_upper_case_globals)]
 pub const FileIdInformation: u32 = 59;
+#[allow(non_upper_case_globals)]
+pub const FileStatInformation: u32 = 68;
+#[allow(non_upper_case_globals)]
+pub const FileStatLxInformation: u32 = 70;
 
 #[repr(C)]
 pub struct FILE_FS_DEVICE_INFORMATION {
@@ -66,6 +84,44 @@ pub struct FILE_FS_FULL_SIZE_INFORMATION {
 pub struct FILE_ID_INFORMATION {
     pub volume_serial_number: u64,
     pub file_id: [u8; 16],
+}
+
+#[derive(Debug)]
+#[repr(C)]
+struct FILE_STAT_INFORMATION {
+    file_id: i64,
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    allocation_size: i64,
+    end_of_file: i64,
+    file_attributes: u32,
+    reparse_tag: u32,
+    number_of_links: u32,
+    effective_access: u32,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+struct FILE_STAT_LX_INFORMATION {
+    file_id: i64,
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    allocation_size: i64,
+    end_of_file: i64,
+    file_attributes: u32,
+    reparse_tag: u32,
+    number_of_links: u32,
+    effective_access: u32,
+    lx_flags: u32,
+    lx_uid: u32,
+    lx_gid: u32,
+    lx_mode: u32,
+    lx_device_id_major: u32,
+    lx_device_id_minor: u32,
 }
 
 #[repr(C)]
@@ -370,4 +426,317 @@ pub fn path_to_owner_and_group(path: &Path) -> Option<OwnerGroup> {
         owner_sid: unsafe { sd_sid_to_fixed(sd, (*sd).owner) },
         group_sid: unsafe { sd_sid_to_fixed(sd, (*sd).group) },
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FileType {
+    file_attributes: u32,
+    reparse_tag: u32,
+}
+
+impl FileType {
+    pub fn is_dir(&self) -> bool {
+        self.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 && !self.is_symlink()
+    }
+
+    pub fn is_file(&self) -> bool {
+        !self.is_dir() && !self.is_symlink()
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.reparse_tag == IO_REPARSE_TAG_SYMLINK || self.reparse_tag == IO_REPARSE_TAG_MOUNT_POINT
+    }
+}
+
+pub trait FileTypeExt {
+    fn is_fifo(&self) -> bool;
+    fn is_char_device(&self) -> bool;
+    fn is_block_device(&self) -> bool;
+}
+
+impl FileTypeExt for FileType {
+    fn is_fifo(&self) -> bool {
+        false
+    }
+
+    fn is_char_device(&self) -> bool {
+        false
+    }
+
+    fn is_block_device(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug)]
+pub struct Metadata {
+    file_type: FileType,
+    len: u64,
+    modified: SystemTime,
+    accessed: SystemTime,
+    created: SystemTime,
+    mode: u32,
+    blocks: u64,
+    dev: u64,
+    uid: u32,
+    gid: u32,
+    nlink: u64,
+    ino: u64,
+    blksize: u64,
+    rdev: u64,
+    user_name: Option<String>,
+    group_name: Option<String>,
+    change_time: Option<SystemTime>,
+}
+
+const LX_FILE_METADATA_HAS_UID: u32 = 0x1;
+const LX_FILE_METADATA_HAS_GID: u32 = 0x2;
+const LX_FILE_METADATA_HAS_MODE: u32 = 0x4;
+const LX_FILE_METADATA_HAS_DEVICE_ID: u32 = 0x8;
+
+fn file_open_options(dereference: bool) -> u32 {
+    FILE_SYNCHRONOUS_IO_NONALERT
+        | FILE_OPEN_FOR_BACKUP_INTENT
+        | if dereference {
+            0
+        } else {
+            FILE_OPEN_REPARSE_POINT
+        }
+}
+
+impl Metadata {
+    fn from_path(path: &Path, dereference: bool) -> UResult<Self> {
+        let handle = open_file(
+            path,
+            SYNCHRONIZE | READ_CONTROL | FILE_READ_EA | FILE_READ_ATTRIBUTES,
+            file_open_options(dereference),
+        )?;
+
+        let mut stat: FILE_STAT_LX_INFORMATION = unsafe { std::mem::zeroed() };
+
+        // FILE_STAT_LX_INFORMATION contains extra fields with WSL metadata.
+        let mut status = unsafe {
+            let mut iosb = MaybeUninit::<IO_STATUS_BLOCK>::uninit();
+            NtQueryInformationFile(
+                handle.0,
+                iosb.as_mut_ptr(),
+                &mut stat as *mut _ as *mut _,
+                size_of::<FILE_STAT_LX_INFORMATION>() as u32,
+                FileStatLxInformation,
+            )
+        };
+        // ...but it may fail for some filesystems (e.g. SMB, ramdisks).
+        // In that case, retry with FILE_STAT_INFORMATION.
+        // NOTE: The base struct layout is identical.
+        if status < 0 {
+            status = unsafe {
+                let mut iosb = MaybeUninit::<IO_STATUS_BLOCK>::uninit();
+                NtQueryInformationFile(
+                    handle.0,
+                    iosb.as_mut_ptr(),
+                    &mut stat as *mut _ as *mut _,
+                    size_of::<FILE_STAT_INFORMATION>() as u32,
+                    FileStatInformation,
+                )
+            };
+        }
+        if status < 0 {
+            return Err(USimpleError::new(
+                1,
+                format!("NtQueryInformationFile failed: 0x{:08X}", status as u32),
+            ));
+        }
+
+        let created = filetime_to_system_time(stat.creation_time);
+        let accessed = filetime_to_system_time(stat.last_access_time);
+        let modified = filetime_to_system_time(stat.last_write_time);
+        let change_time = (stat.change_time > 0).then(|| filetime_to_system_time(stat.change_time));
+        let allocation_size = stat.allocation_size.max(0) as u64;
+        let len = stat.end_of_file.max(0) as u64;
+        let file_type = FileType {
+            file_attributes: stat.file_attributes,
+            reparse_tag: stat.reparse_tag,
+        };
+        let nlink = stat.number_of_links as u64;
+        let ino = stat.file_id as u64;
+        let mode = if stat.lx_flags & LX_FILE_METADATA_HAS_MODE != 0 {
+            stat.lx_mode
+        } else {
+            const S_IFLNK: u32 = 0o120_000;
+            const S_IFREG: u32 = 0o100_000;
+            const S_IFDIR: u32 = 0o040_000;
+            let file_type_bits = if file_type.is_symlink() {
+                S_IFLNK
+            } else if file_type.is_dir() {
+                S_IFDIR
+            } else {
+                S_IFREG
+            };
+            let permission_bits = if stat.file_attributes & FILE_ATTRIBUTE_READONLY != 0 {
+                0o555
+            } else {
+                0o777
+            };
+            file_type_bits | permission_bits
+        };
+        let uid = if stat.lx_flags & LX_FILE_METADATA_HAS_UID != 0 {
+            stat.lx_uid
+        } else {
+            0
+        };
+        let gid = if stat.lx_flags & LX_FILE_METADATA_HAS_GID != 0 {
+            stat.lx_gid
+        } else {
+            0
+        };
+        let rdev = if stat.lx_flags & LX_FILE_METADATA_HAS_DEVICE_ID != 0 {
+            (stat.lx_device_id_major as u64) << 32 | (stat.lx_device_id_minor as u64)
+        } else {
+            0
+        };
+
+        let dev = if let Ok(file_id) =
+            unsafe { query_information_file::<FILE_ID_INFORMATION>(&handle, FileIdInformation) }
+        {
+            file_id.volume_serial_number
+        } else {
+            0
+        };
+
+        let blksize = if let Ok(vol) = unsafe {
+            query_volume_information::<FILE_FS_FULL_SIZE_INFORMATION>(
+                &handle,
+                FileFsFullSizeInformation,
+            )
+        } {
+            let bs = vol.sectors_per_allocation_unit as u64 * vol.bytes_per_sector as u64;
+            if bs != 0 { bs } else { 4096 }
+        } else {
+            4096
+        };
+
+        let owner_group = path_to_owner_and_group(path);
+        let user_name = owner_group
+            .as_ref()
+            .and_then(|og| resolve_sid_to_name(og.owner_sid.as_ptr().cast_mut().cast()));
+        let group_name = owner_group
+            .as_ref()
+            .and_then(|og| resolve_sid_to_name(og.group_sid.as_ptr().cast_mut().cast()));
+
+        Ok(Self {
+            mode,
+            blocks: allocation_size.div_ceil(512),
+            file_type,
+            len,
+            modified,
+            accessed,
+            created,
+            dev,
+            uid,
+            gid,
+            nlink,
+            ino,
+            blksize,
+            rdev,
+            user_name,
+            group_name,
+            change_time,
+        })
+    }
+
+    pub fn file_type(&self) -> FileType {
+        self.file_type
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn modified(&self) -> io::Result<SystemTime> {
+        Ok(self.modified)
+    }
+
+    pub fn accessed(&self) -> io::Result<SystemTime> {
+        Ok(self.accessed)
+    }
+
+    pub fn created(&self) -> io::Result<SystemTime> {
+        Ok(self.created)
+    }
+
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    pub fn blocks(&self) -> u64 {
+        self.blocks
+    }
+
+    pub fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    pub fn nlink(&self) -> u64 {
+        self.nlink
+    }
+
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    pub fn blksize(&self) -> u64 {
+        self.blksize
+    }
+
+    pub fn rdev(&self) -> u64 {
+        self.rdev
+    }
+
+    pub fn user_name(&self) -> Option<&str> {
+        self.user_name.as_deref()
+    }
+
+    pub fn group_name(&self) -> Option<&str> {
+        self.group_name.as_deref()
+    }
+
+    pub fn change_time(&self) -> Option<SystemTime> {
+        self.change_time
+    }
+}
+
+pub fn metadata<P: AsRef<Path>>(path: P) -> UResult<Metadata> {
+    Metadata::from_path(path.as_ref(), true)
+}
+
+pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> UResult<Metadata> {
+    Metadata::from_path(path.as_ref(), false)
+}
+
+pub fn metadata_get_time(metadata: &Metadata, md_time: MetadataTimeField) -> Option<SystemTime> {
+    match md_time {
+        MetadataTimeField::Change => metadata.change_time,
+        MetadataTimeField::Modification => Some(metadata.modified),
+        MetadataTimeField::Access => Some(metadata.accessed),
+        MetadataTimeField::Birth => Some(metadata.created),
+    }
+}
+
+const _: () = unsafe {
+    assert!(
+        std::mem::transmute::<SystemTime, i64>(std::time::UNIX_EPOCH)
+            == 11_644_473_600 * 10_000_000
+    );
+};
+
+fn filetime_to_system_time(value: i64) -> SystemTime {
+    unsafe { std::mem::transmute::<i64, SystemTime>(value) }
 }
