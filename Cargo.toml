@@ -272,6 +272,7 @@ feat_os_unix_musl = [
 # "feat_os_windows" == set of utilities which can be built/run on modern/usual windows platforms
 feat_os_windows = [
   "feat_Tier1", ## == "feat_os_windows_legacy" + "hostname"
+  "stat",
   "uptime",
 ]
 ## (secondary platforms) feature sets

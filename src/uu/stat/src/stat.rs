@@ -9,23 +9,31 @@ use uucore::translate;
 
 use clap::builder::ValueParser;
 use uucore::display::Quotable;
-use uucore::fs::{display_permissions, major, minor};
+#[cfg(unix)]
+use uucore::entries;
+use uucore::fs::{display_permissions_unix, major, minor};
+#[cfg(unix)]
+use uucore::fsext::metadata_get_time;
 use uucore::fsext::{
-    FsMeta, MetadataTimeField, StatFs, metadata_get_time, pretty_filetype, pretty_fstype,
-    read_fs_list, statfs,
+    FsMeta, MetadataTimeField, StatFs, pretty_filetype, pretty_fstype, read_fs_list, statfs,
 };
-use uucore::libc::mode_t;
-use uucore::{entries, format_usage, show_error, show_warning};
+#[cfg(windows)]
+use uucore::nt::{FileTypeExt, Metadata, metadata_get_time};
+use uucore::{format_usage, show_error, show_warning};
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
 use std::fs::{FileType, Metadata};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::{env, fs};
+#[cfg(windows)]
+use uucore::nt::FileType;
 
 use thiserror::Error;
 use uucore::time::{FormatSystemTimeFallback, format_system_time, system_time_to_sec};
@@ -118,6 +126,7 @@ fn pad_and_print(result: &str, left: bool, width: usize, padding: Padding) {
 ///
 /// On Unix systems, this preserves non-UTF8 data by printing raw bytes
 /// On other platforms, falls back to lossy string conversion
+#[cfg(any(unix, test))]
 fn pad_and_print_bytes<W: Write>(
     mut writer: W,
     bytes: &[u8],
@@ -153,6 +162,7 @@ fn pad_and_print_bytes<W: Write>(
 /// write padding based on a writer W and n size
 /// writer is genric to be any buffer like: `std::io::stdout`
 /// n is the calculated padding size
+#[cfg(any(unix, test))]
 fn write_padding<W: Write>(writer: &mut W, n: usize) -> Result<(), std::io::Error> {
     for _ in 0..n {
         writer.write_all(b" ")?;
@@ -276,6 +286,26 @@ impl ScanUtil for str {
             None
         }
     }
+}
+
+#[cfg(unix)]
+fn path_metadata(path: &OsStr) -> std::io::Result<Metadata> {
+    fs::metadata(path)
+}
+
+#[cfg(unix)]
+fn path_symlink_metadata(path: &OsStr) -> std::io::Result<Metadata> {
+    fs::symlink_metadata(path)
+}
+
+#[cfg(windows)]
+fn path_metadata(path: &OsStr) -> UResult<Metadata> {
+    uucore::nt::metadata(path)
+}
+
+#[cfg(windows)]
+fn path_symlink_metadata(path: &OsStr) -> UResult<Metadata> {
+    uucore::nt::symlink_metadata(path)
 }
 
 fn group_num(s: &str) -> Cow<'_, str> {
@@ -1010,11 +1040,11 @@ impl Stater {
     }
 
     fn exec(&self) -> i32 {
+        #[allow(unused_mut)]
         let mut stdin_is_fifo = false;
-        if cfg!(unix) {
-            if let Ok(md) = fs::metadata("/dev/stdin") {
-                stdin_is_fifo = md.file_type().is_fifo();
-            }
+        #[cfg(unix)]
+        if let Ok(md) = fs::metadata("/dev/stdin") {
+            stdin_is_fifo = md.file_type().is_fifo();
         }
 
         let mut ret = 0;
@@ -1052,7 +1082,7 @@ impl Stater {
                     // access rights in octal
                     'a' => OutputType::UnsignedOct(0o7777 & meta.mode()),
                     // access rights in human readable form
-                    'A' => OutputType::Str(display_permissions(meta, true)),
+                    'A' => OutputType::Str(display_permissions_unix(meta.mode(), true)),
                     // number of blocks allocated (see %B)
                     'b' => OutputType::Unsigned(meta.blocks()),
 
@@ -1098,15 +1128,18 @@ impl Stater {
                     // raw mode in hex
                     'f' => OutputType::UnsignedHex(meta.mode() as u64),
                     // file type
-                    'F' => OutputType::Str(pretty_filetype(meta.mode() as mode_t, meta.len())),
+                    'F' => OutputType::Str(pretty_filetype(meta.mode() as _, meta.len())),
                     // group ID of owner
                     'g' => OutputType::Unsigned(meta.gid() as u64),
                     // group name of owner
+                    #[cfg(unix)]
                     'G' => {
                         let group_name =
                             entries::gid2grp(meta.gid()).unwrap_or_else(|_| "UNKNOWN".to_owned());
                         OutputType::Str(group_name)
                     }
+                    #[cfg(windows)]
+                    'G' => OutputType::Str(meta.group_name().unwrap_or("UNKNOWN").to_owned()),
                     // number of hard links
                     'h' => OutputType::Unsigned(meta.nlink()),
                     // inode number
@@ -1138,9 +1171,12 @@ impl Stater {
                     'u' => OutputType::Unsigned(meta.uid() as u64),
                     // user name of owner
                     'U' => {
-                        let user_name =
+                        #[cfg(unix)]
+                        let name =
                             entries::uid2usr(meta.uid()).unwrap_or_else(|_| "UNKNOWN".to_owned());
-                        OutputType::Str(user_name)
+                        #[cfg(windows)]
+                        let name = meta.user_name().unwrap_or("UNKNOWN").to_owned();
+                        OutputType::Str(name)
                     }
 
                     // time of file birth, human-readable; - if unknown
@@ -1227,9 +1263,9 @@ impl Stater {
         } else {
             let follow_symbolic_links = self.follow || stdin_is_fifo && display_name == "-";
             let result = if follow_symbolic_links {
-                fs::metadata(&file)
+                path_metadata(&file)
             } else {
-                fs::symlink_metadata(&file)
+                path_symlink_metadata(&file)
             };
             match result {
                 Ok(meta) => {
