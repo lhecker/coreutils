@@ -35,6 +35,7 @@ const DEFAULT_LOCALE: Locale = locale!("und");
 /// 3. LANG
 ///
 /// Or fallback on Posix locale, with ASCII encoding.
+#[cfg(not(windows))]
 pub fn get_locale_from_env(locale_name: &str) -> (Locale, UEncoding) {
     let locale_var = ["LC_ALL", locale_name, "LANG"]
         .iter()
@@ -70,8 +71,81 @@ pub fn get_locale_from_env(locale_name: &str) -> (Locale, UEncoding) {
             return (locale, encoding);
         }
     }
+
+    // Windows has no LC_* or LANG environment variables and instead it uses APIs such as GetUserPreferredUILanguages.
+    #[cfg(windows)]
+    return (DEFAULT_LOCALE, UEncoding::Utf8);
+
     // Default POSIX locale representing LC_ALL=C
+    #[cfg(not(windows))]
     (DEFAULT_LOCALE, UEncoding::Ascii)
+}
+
+#[cfg(windows)]
+pub fn get_locale_from_env(_locale_name: &str) -> (Locale, UEncoding) {
+    use std::mem::MaybeUninit;
+    use std::ptr::{null, null_mut};
+    use std::str;
+    use windows_sys::Win32::Globalization::{
+        CP_UTF8, GetUserPreferredUILanguages, MUI_LANGUAGE_NAME, WideCharToMultiByte,
+    };
+
+    /// assume_init_ref is only stable starting Rust 1.93.
+    /// We cannot use it in the current MSRV of 1.88.
+    ///
+    /// # Safety
+    ///
+    /// Same as the official `assume_init_ref`.
+    unsafe fn assume_init_ref<T>(s: &[MaybeUninit<T>]) -> &[T] {
+        unsafe { &*(s as *const [MaybeUninit<T>] as *const [T]) }
+    }
+
+    const LEN: usize = 512;
+
+    let mut utf16 = [const { MaybeUninit::<u16>::uninit() }; LEN];
+    let mut utf8 = [const { MaybeUninit::<u8>::uninit() }; LEN * 3];
+    let mut len = utf16.len() as u32;
+    let mut num = 0;
+
+    let ok = unsafe {
+        GetUserPreferredUILanguages(
+            MUI_LANGUAGE_NAME,
+            &raw mut num,
+            utf16.as_mut_ptr().cast(),
+            &raw mut len,
+        )
+    };
+    if ok == 0 || num == 0 {
+        return (DEFAULT_LOCALE, UEncoding::Utf8);
+    }
+
+    let utf16_len = utf16.len().min(len.saturating_sub(1) as usize);
+    let utf8_len = unsafe {
+        WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            utf16.as_mut_ptr().cast(),
+            utf16_len as i32,
+            utf8.as_mut_ptr().cast(),
+            utf8.len() as i32,
+            null(),
+            null_mut(),
+        )
+    };
+    if utf8_len == 0 {
+        return (DEFAULT_LOCALE, UEncoding::Utf8);
+    }
+
+    let utf8 = &utf8[..utf8_len as usize];
+    let utf8 = unsafe { assume_init_ref(utf8) };
+    let utf8 = unsafe { str::from_utf8_unchecked(utf8) };
+    let locale = utf8
+        .split_terminator('\0')
+        .filter(|lang| !lang.is_empty())
+        .find_map(|lang| Locale::try_from_str(lang).ok())
+        .unwrap_or(DEFAULT_LOCALE);
+
+    (locale, UEncoding::Utf8)
 }
 
 /// Get the collating locale from the environment
